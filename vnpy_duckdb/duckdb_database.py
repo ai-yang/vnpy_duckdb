@@ -1,0 +1,815 @@
+from datetime import datetime
+from pathlib import Path
+from threading import RLock
+from typing import Any
+
+import duckdb
+import pandas as pd
+
+from vnpy.trader.constant import Exchange, Interval
+from vnpy.trader.database import (
+    BarOverview,
+    BaseDatabase,
+    DB_TZ,
+    TickOverview,
+    convert_tz,
+)
+from vnpy.trader.object import BarData, TickData
+from vnpy.trader.setting import SETTINGS
+from vnpy.trader.utility import get_file_path
+
+
+BAR_COLUMNS: list[str] = [
+    "symbol",
+    "exchange",
+    "datetime",
+    "interval",
+    "volume",
+    "turnover",
+    "open_interest",
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+]
+
+TICK_COLUMNS: list[str] = [
+    "symbol",
+    "exchange",
+    "datetime",
+    "name",
+    "volume",
+    "turnover",
+    "open_interest",
+    "last_price",
+    "last_volume",
+    "limit_up",
+    "limit_down",
+    "open_price",
+    "high_price",
+    "low_price",
+    "pre_close",
+    "bid_price_1",
+    "bid_price_2",
+    "bid_price_3",
+    "bid_price_4",
+    "bid_price_5",
+    "ask_price_1",
+    "ask_price_2",
+    "ask_price_3",
+    "ask_price_4",
+    "ask_price_5",
+    "bid_volume_1",
+    "bid_volume_2",
+    "bid_volume_3",
+    "bid_volume_4",
+    "bid_volume_5",
+    "ask_volume_1",
+    "ask_volume_2",
+    "ask_volume_3",
+    "ask_volume_4",
+    "ask_volume_5",
+    "localtime",
+]
+
+BAR_KEY: list[str] = ["symbol", "exchange", "interval", "datetime"]
+TICK_KEY: list[str] = ["symbol", "exchange", "datetime"]
+
+
+class DuckdbDatabase(BaseDatabase):
+    """DuckDB database interface."""
+
+    def __init__(self, database: str | Path | None = None) -> None:
+        """"""
+        filename: str | Path = database or SETTINGS["database.database"] or "database.duckdb"
+        self.path: Path = get_file_path(str(filename))
+        self.lock: RLock = RLock()
+        self.conn: duckdb.DuckDBPyConnection = duckdb.connect(str(self.path))
+
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        """Create tables if they do not exist."""
+        with self.lock:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dbbardata (
+                    symbol VARCHAR NOT NULL,
+                    exchange VARCHAR NOT NULL,
+                    datetime TIMESTAMP NOT NULL,
+                    interval VARCHAR NOT NULL,
+                    volume DOUBLE NOT NULL,
+                    turnover DOUBLE NOT NULL,
+                    open_interest DOUBLE NOT NULL,
+                    open_price DOUBLE NOT NULL,
+                    high_price DOUBLE NOT NULL,
+                    low_price DOUBLE NOT NULL,
+                    close_price DOUBLE NOT NULL,
+                    PRIMARY KEY (symbol, exchange, interval, datetime)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dbtickdata (
+                    symbol VARCHAR NOT NULL,
+                    exchange VARCHAR NOT NULL,
+                    datetime TIMESTAMP NOT NULL,
+                    name VARCHAR NOT NULL,
+                    volume DOUBLE NOT NULL,
+                    turnover DOUBLE NOT NULL,
+                    open_interest DOUBLE NOT NULL,
+                    last_price DOUBLE NOT NULL,
+                    last_volume DOUBLE NOT NULL,
+                    limit_up DOUBLE NOT NULL,
+                    limit_down DOUBLE NOT NULL,
+                    open_price DOUBLE NOT NULL,
+                    high_price DOUBLE NOT NULL,
+                    low_price DOUBLE NOT NULL,
+                    pre_close DOUBLE NOT NULL,
+                    bid_price_1 DOUBLE NOT NULL,
+                    bid_price_2 DOUBLE NOT NULL,
+                    bid_price_3 DOUBLE NOT NULL,
+                    bid_price_4 DOUBLE NOT NULL,
+                    bid_price_5 DOUBLE NOT NULL,
+                    ask_price_1 DOUBLE NOT NULL,
+                    ask_price_2 DOUBLE NOT NULL,
+                    ask_price_3 DOUBLE NOT NULL,
+                    ask_price_4 DOUBLE NOT NULL,
+                    ask_price_5 DOUBLE NOT NULL,
+                    bid_volume_1 DOUBLE NOT NULL,
+                    bid_volume_2 DOUBLE NOT NULL,
+                    bid_volume_3 DOUBLE NOT NULL,
+                    bid_volume_4 DOUBLE NOT NULL,
+                    bid_volume_5 DOUBLE NOT NULL,
+                    ask_volume_1 DOUBLE NOT NULL,
+                    ask_volume_2 DOUBLE NOT NULL,
+                    ask_volume_3 DOUBLE NOT NULL,
+                    ask_volume_4 DOUBLE NOT NULL,
+                    ask_volume_5 DOUBLE NOT NULL,
+                    localtime TIMESTAMP,
+                    PRIMARY KEY (symbol, exchange, datetime)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dbbaroverview (
+                    symbol VARCHAR NOT NULL,
+                    exchange VARCHAR NOT NULL,
+                    interval VARCHAR NOT NULL,
+                    count INTEGER NOT NULL,
+                    start TIMESTAMP NOT NULL,
+                    "end" TIMESTAMP NOT NULL,
+                    PRIMARY KEY (symbol, exchange, interval)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dbtickoverview (
+                    symbol VARCHAR NOT NULL,
+                    exchange VARCHAR NOT NULL,
+                    count INTEGER NOT NULL,
+                    start TIMESTAMP NOT NULL,
+                    "end" TIMESTAMP NOT NULL,
+                    PRIMARY KEY (symbol, exchange)
+                )
+                """
+            )
+
+    def save_bar_data(self, bars: list[BarData], stream: bool = False) -> bool:
+        """Save bar data into database."""
+        if not bars:
+            return False
+
+        bar: BarData = bars[0]
+        symbol: str = bar.symbol
+        exchange: Exchange = bar.exchange
+        interval: Interval | None = bar.interval
+        if not interval:
+            return False
+
+        rows: list[dict[str, Any]] = [self._bar_to_dict(bar) for bar in bars]
+        df: pd.DataFrame = pd.DataFrame(rows, columns=BAR_COLUMNS)
+        df = df.drop_duplicates(subset=BAR_KEY, keep="last")
+        unique_count: int = len(df)
+        start: datetime = df["datetime"].min().to_pydatetime()
+        end: datetime = df["datetime"].max().to_pydatetime()
+
+        with self.lock:
+            self._register_and_write_bar(
+                df,
+                symbol,
+                exchange.value,
+                interval.value,
+                start,
+                end,
+                unique_count,
+                stream,
+            )
+
+        return True
+
+    def save_tick_data(self, ticks: list[TickData], stream: bool = False) -> bool:
+        """Save tick data into database."""
+        if not ticks:
+            return False
+
+        tick: TickData = ticks[0]
+        symbol: str = tick.symbol
+        exchange: Exchange = tick.exchange
+
+        rows: list[dict[str, Any]] = [self._tick_to_dict(tick) for tick in ticks]
+        df: pd.DataFrame = pd.DataFrame(rows, columns=TICK_COLUMNS)
+        df = df.drop_duplicates(subset=TICK_KEY, keep="last")
+        unique_count: int = len(df)
+        start: datetime = df["datetime"].min().to_pydatetime()
+        end: datetime = df["datetime"].max().to_pydatetime()
+
+        with self.lock:
+            self._register_and_write_tick(
+                df,
+                symbol,
+                exchange.value,
+                start,
+                end,
+                unique_count,
+                stream,
+            )
+
+        return True
+
+    def load_bar_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+    ) -> list[BarData]:
+        """Load bar data from database."""
+        sql: str = """
+            SELECT symbol, exchange, datetime, interval, volume, turnover,
+                   open_interest, open_price, high_price, low_price, close_price
+            FROM dbbardata
+            WHERE symbol = ?
+              AND exchange = ?
+              AND interval = ?
+              AND datetime >= ?
+              AND datetime <= ?
+            ORDER BY datetime
+        """
+        params: tuple = (
+            symbol,
+            exchange.value,
+            interval.value,
+            self._normalize_query_datetime(start),
+            self._normalize_query_datetime(end),
+        )
+
+        with self.lock:
+            rows: list[tuple] = self.conn.execute(sql, params).fetchall()
+
+        bars: list[BarData] = []
+        for row in rows:
+            bar: BarData = BarData(
+                symbol=row[0],
+                exchange=Exchange(row[1]),
+                datetime=self._restore_datetime(row[2]),
+                interval=Interval(row[3]),
+                volume=row[4],
+                turnover=row[5],
+                open_interest=row[6],
+                open_price=row[7],
+                high_price=row[8],
+                low_price=row[9],
+                close_price=row[10],
+                gateway_name="DB",
+            )
+            bars.append(bar)
+
+        return bars
+
+    def load_tick_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime,
+    ) -> list[TickData]:
+        """Load tick data from database."""
+        columns: str = ", ".join(TICK_COLUMNS)
+        sql: str = f"""
+            SELECT {columns}
+            FROM dbtickdata
+            WHERE symbol = ?
+              AND exchange = ?
+              AND datetime >= ?
+              AND datetime <= ?
+            ORDER BY datetime
+        """
+        params: tuple = (
+            symbol,
+            exchange.value,
+            self._normalize_query_datetime(start),
+            self._normalize_query_datetime(end),
+        )
+
+        with self.lock:
+            rows: list[tuple] = self.conn.execute(sql, params).fetchall()
+
+        ticks: list[TickData] = []
+        for row in rows:
+            data: dict[str, Any] = dict(zip(TICK_COLUMNS, row, strict=True))
+            tick: TickData = TickData(
+                symbol=data["symbol"],
+                exchange=Exchange(data["exchange"]),
+                datetime=self._restore_datetime(data["datetime"]),
+                name=data["name"],
+                volume=data["volume"],
+                turnover=data["turnover"],
+                open_interest=data["open_interest"],
+                last_price=data["last_price"],
+                last_volume=data["last_volume"],
+                limit_up=data["limit_up"],
+                limit_down=data["limit_down"],
+                open_price=data["open_price"],
+                high_price=data["high_price"],
+                low_price=data["low_price"],
+                pre_close=data["pre_close"],
+                bid_price_1=data["bid_price_1"],
+                bid_price_2=data["bid_price_2"],
+                bid_price_3=data["bid_price_3"],
+                bid_price_4=data["bid_price_4"],
+                bid_price_5=data["bid_price_5"],
+                ask_price_1=data["ask_price_1"],
+                ask_price_2=data["ask_price_2"],
+                ask_price_3=data["ask_price_3"],
+                ask_price_4=data["ask_price_4"],
+                ask_price_5=data["ask_price_5"],
+                bid_volume_1=data["bid_volume_1"],
+                bid_volume_2=data["bid_volume_2"],
+                bid_volume_3=data["bid_volume_3"],
+                bid_volume_4=data["bid_volume_4"],
+                bid_volume_5=data["bid_volume_5"],
+                ask_volume_1=data["ask_volume_1"],
+                ask_volume_2=data["ask_volume_2"],
+                ask_volume_3=data["ask_volume_3"],
+                ask_volume_4=data["ask_volume_4"],
+                ask_volume_5=data["ask_volume_5"],
+                localtime=data["localtime"],
+                gateway_name="DB",
+            )
+            ticks.append(tick)
+
+        return ticks
+
+    def delete_bar_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        interval: Interval,
+    ) -> int:
+        """Delete all bar data with given symbol + exchange + interval."""
+        with self.lock:
+            self.conn.execute("BEGIN TRANSACTION")
+            try:
+                count: int = self.conn.execute(
+                    """
+                    SELECT count(*)
+                    FROM dbbardata
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    (symbol, exchange.value, interval.value),
+                ).fetchone()[0]
+                self.conn.execute(
+                    """
+                    DELETE FROM dbbardata
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    (symbol, exchange.value, interval.value),
+                )
+                self.conn.execute(
+                    """
+                    DELETE FROM dbbaroverview
+                    WHERE symbol = ? AND exchange = ? AND interval = ?
+                    """,
+                    (symbol, exchange.value, interval.value),
+                )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+        return count
+
+    def delete_tick_data(self, symbol: str, exchange: Exchange) -> int:
+        """Delete all tick data with given symbol + exchange."""
+        with self.lock:
+            self.conn.execute("BEGIN TRANSACTION")
+            try:
+                count: int = self.conn.execute(
+                    """
+                    SELECT count(*)
+                    FROM dbtickdata
+                    WHERE symbol = ? AND exchange = ?
+                    """,
+                    (symbol, exchange.value),
+                ).fetchone()[0]
+                self.conn.execute(
+                    """
+                    DELETE FROM dbtickdata
+                    WHERE symbol = ? AND exchange = ?
+                    """,
+                    (symbol, exchange.value),
+                )
+                self.conn.execute(
+                    """
+                    DELETE FROM dbtickoverview
+                    WHERE symbol = ? AND exchange = ?
+                    """,
+                    (symbol, exchange.value),
+                )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+        return count
+
+    def get_bar_overview(self) -> list[BarOverview]:
+        """Return bar data available in database."""
+        with self.lock:
+            data_count: int = self.conn.execute("SELECT count(*) FROM dbbardata").fetchone()[0]
+            overview_count: int = self.conn.execute("SELECT count(*) FROM dbbaroverview").fetchone()[0]
+            if data_count and not overview_count:
+                self.init_bar_overview()
+
+            rows: list[tuple] = self.conn.execute(
+                """
+                SELECT symbol, exchange, interval, count, start, "end"
+                FROM dbbaroverview
+                ORDER BY symbol, exchange, interval
+                """
+            ).fetchall()
+
+        return [
+            BarOverview(
+                symbol=row[0],
+                exchange=Exchange(row[1]),
+                interval=Interval(row[2]),
+                count=row[3],
+                start=self._restore_datetime(row[4]),
+                end=self._restore_datetime(row[5]),
+            )
+            for row in rows
+        ]
+
+    def get_tick_overview(self) -> list[TickOverview]:
+        """Return tick data available in database."""
+        with self.lock:
+            data_count: int = self.conn.execute("SELECT count(*) FROM dbtickdata").fetchone()[0]
+            overview_count: int = self.conn.execute("SELECT count(*) FROM dbtickoverview").fetchone()[0]
+            if data_count and not overview_count:
+                self.init_tick_overview()
+
+            rows: list[tuple] = self.conn.execute(
+                """
+                SELECT symbol, exchange, count, start, "end"
+                FROM dbtickoverview
+                ORDER BY symbol, exchange
+                """
+            ).fetchall()
+
+        return [
+            TickOverview(
+                symbol=row[0],
+                exchange=Exchange(row[1]),
+                count=row[2],
+                start=self._restore_datetime(row[3]),
+                end=self._restore_datetime(row[4]),
+            )
+            for row in rows
+        ]
+
+    def init_bar_overview(self) -> None:
+        """Initialize bar overview from existing bar data."""
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO dbbaroverview BY NAME
+                SELECT
+                    symbol,
+                    exchange,
+                    interval,
+                    count(*)::INTEGER AS count,
+                    min(datetime) AS start,
+                    max(datetime) AS "end"
+                FROM dbbardata
+                GROUP BY symbol, exchange, interval
+                """
+            )
+
+    def init_tick_overview(self) -> None:
+        """Initialize tick overview from existing tick data."""
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO dbtickoverview BY NAME
+                SELECT
+                    symbol,
+                    exchange,
+                    count(*)::INTEGER AS count,
+                    min(datetime) AS start,
+                    max(datetime) AS "end"
+                FROM dbtickdata
+                GROUP BY symbol, exchange
+                """
+            )
+
+    def close(self) -> None:
+        """Close database connection."""
+        with self.lock:
+            self.conn.close()
+
+    def _register_and_write_bar(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        exchange: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        count: int,
+        stream: bool,
+    ) -> None:
+        """Register bar DataFrame and upsert it with overview in one transaction."""
+        self.conn.register("bar_staging", df)
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("INSERT OR REPLACE INTO dbbardata BY NAME SELECT * FROM bar_staging")
+            if stream:
+                self._upsert_stream_bar_overview(symbol, exchange, interval, start, end, count)
+            else:
+                self._refresh_bar_overview(symbol, exchange, interval)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        finally:
+            self.conn.unregister("bar_staging")
+
+    def _register_and_write_tick(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        exchange: str,
+        start: datetime,
+        end: datetime,
+        count: int,
+        stream: bool,
+    ) -> None:
+        """Register tick DataFrame and upsert it with overview in one transaction."""
+        self.conn.register("tick_staging", df)
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("INSERT OR REPLACE INTO dbtickdata BY NAME SELECT * FROM tick_staging")
+            if stream:
+                self._upsert_stream_tick_overview(symbol, exchange, start, end, count)
+            else:
+                self._refresh_tick_overview(symbol, exchange)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        finally:
+            self.conn.unregister("tick_staging")
+
+    def _upsert_stream_bar_overview(
+        self,
+        symbol: str,
+        exchange: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        count: int,
+    ) -> None:
+        """Incrementally update bar overview for streaming writes."""
+        row: tuple | None = self.conn.execute(
+            """
+            SELECT count, start, "end"
+            FROM dbbaroverview
+            WHERE symbol = ? AND exchange = ? AND interval = ?
+            """,
+            (symbol, exchange, interval),
+        ).fetchone()
+
+        if row:
+            overview_count, overview_start, overview_end = row
+            self.conn.execute(
+                """
+                UPDATE dbbaroverview
+                SET count = ?, start = ?, "end" = ?
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+                """,
+                (
+                    overview_count + count,
+                    min(overview_start, start),
+                    max(overview_end, end),
+                    symbol,
+                    exchange,
+                    interval,
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO dbbaroverview
+                    (symbol, exchange, interval, count, start, "end")
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, exchange, interval, count, start, end),
+            )
+
+    def _upsert_stream_tick_overview(
+        self,
+        symbol: str,
+        exchange: str,
+        start: datetime,
+        end: datetime,
+        count: int,
+    ) -> None:
+        """Incrementally update tick overview for streaming writes."""
+        row: tuple | None = self.conn.execute(
+            """
+            SELECT count, start, "end"
+            FROM dbtickoverview
+            WHERE symbol = ? AND exchange = ?
+            """,
+            (symbol, exchange),
+        ).fetchone()
+
+        if row:
+            overview_count, overview_start, overview_end = row
+            self.conn.execute(
+                """
+                UPDATE dbtickoverview
+                SET count = ?, start = ?, "end" = ?
+                WHERE symbol = ? AND exchange = ?
+                """,
+                (
+                    overview_count + count,
+                    min(overview_start, start),
+                    max(overview_end, end),
+                    symbol,
+                    exchange,
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO dbtickoverview
+                    (symbol, exchange, count, start, "end")
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (symbol, exchange, count, start, end),
+            )
+
+    def _refresh_bar_overview(self, symbol: str, exchange: str, interval: str) -> None:
+        """Refresh bar overview with an exact count."""
+        row: tuple | None = self.conn.execute(
+            """
+            SELECT count(*)::INTEGER, min(datetime), max(datetime)
+            FROM dbbardata
+            WHERE symbol = ? AND exchange = ? AND interval = ?
+            """,
+            (symbol, exchange, interval),
+        ).fetchone()
+
+        count, start, end = row
+        if count:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO dbbaroverview
+                    (symbol, exchange, interval, count, start, "end")
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, exchange, interval, count, start, end),
+            )
+        else:
+            self.conn.execute(
+                """
+                DELETE FROM dbbaroverview
+                WHERE symbol = ? AND exchange = ? AND interval = ?
+                """,
+                (symbol, exchange, interval),
+            )
+
+    def _refresh_tick_overview(self, symbol: str, exchange: str) -> None:
+        """Refresh tick overview with an exact count."""
+        row: tuple | None = self.conn.execute(
+            """
+            SELECT count(*)::INTEGER, min(datetime), max(datetime)
+            FROM dbtickdata
+            WHERE symbol = ? AND exchange = ?
+            """,
+            (symbol, exchange),
+        ).fetchone()
+
+        count, start, end = row
+        if count:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO dbtickoverview
+                    (symbol, exchange, count, start, "end")
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (symbol, exchange, count, start, end),
+            )
+        else:
+            self.conn.execute(
+                """
+                DELETE FROM dbtickoverview
+                WHERE symbol = ? AND exchange = ?
+                """,
+                (symbol, exchange),
+            )
+
+    @staticmethod
+    def _bar_to_dict(bar: BarData) -> dict[str, Any]:
+        """Convert BarData to a database row."""
+        return {
+            "symbol": bar.symbol,
+            "exchange": bar.exchange.value,
+            "datetime": convert_tz(bar.datetime),
+            "interval": bar.interval.value,
+            "volume": bar.volume,
+            "turnover": bar.turnover,
+            "open_interest": bar.open_interest,
+            "open_price": bar.open_price,
+            "high_price": bar.high_price,
+            "low_price": bar.low_price,
+            "close_price": bar.close_price,
+        }
+
+    @staticmethod
+    def _tick_to_dict(tick: TickData) -> dict[str, Any]:
+        """Convert TickData to a database row."""
+        return {
+            "symbol": tick.symbol,
+            "exchange": tick.exchange.value,
+            "datetime": convert_tz(tick.datetime),
+            "name": tick.name,
+            "volume": tick.volume,
+            "turnover": tick.turnover,
+            "open_interest": tick.open_interest,
+            "last_price": tick.last_price,
+            "last_volume": tick.last_volume,
+            "limit_up": tick.limit_up,
+            "limit_down": tick.limit_down,
+            "open_price": tick.open_price,
+            "high_price": tick.high_price,
+            "low_price": tick.low_price,
+            "pre_close": tick.pre_close,
+            "bid_price_1": tick.bid_price_1,
+            "bid_price_2": tick.bid_price_2,
+            "bid_price_3": tick.bid_price_3,
+            "bid_price_4": tick.bid_price_4,
+            "bid_price_5": tick.bid_price_5,
+            "ask_price_1": tick.ask_price_1,
+            "ask_price_2": tick.ask_price_2,
+            "ask_price_3": tick.ask_price_3,
+            "ask_price_4": tick.ask_price_4,
+            "ask_price_5": tick.ask_price_5,
+            "bid_volume_1": tick.bid_volume_1,
+            "bid_volume_2": tick.bid_volume_2,
+            "bid_volume_3": tick.bid_volume_3,
+            "bid_volume_4": tick.bid_volume_4,
+            "bid_volume_5": tick.bid_volume_5,
+            "ask_volume_1": tick.ask_volume_1,
+            "ask_volume_2": tick.ask_volume_2,
+            "ask_volume_3": tick.ask_volume_3,
+            "ask_volume_4": tick.ask_volume_4,
+            "ask_volume_5": tick.ask_volume_5,
+            "localtime": DuckdbDatabase._normalize_optional_datetime(tick.localtime),
+        }
+
+    @staticmethod
+    def _normalize_query_datetime(dt: datetime) -> datetime:
+        """Convert query datetime to the DB timezone's naive timestamp."""
+        if dt.tzinfo:
+            return convert_tz(dt)
+        return dt
+
+    @staticmethod
+    def _normalize_optional_datetime(dt: datetime | None) -> datetime | None:
+        """Normalize optional datetime values before storing."""
+        if dt and dt.tzinfo:
+            return convert_tz(dt)
+        return dt
+
+    @staticmethod
+    def _restore_datetime(dt: datetime) -> datetime:
+        """Restore a stored naive timestamp as a DB timezone-aware datetime."""
+        return dt.replace(tzinfo=DB_TZ)
