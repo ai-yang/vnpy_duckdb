@@ -382,7 +382,7 @@ class DuckdbDatabase(BaseDatabase):
                     WHERE symbol = ? AND exchange = ? AND interval = ?
                     """,
                     (symbol, exchange.value, interval.value),
-                ).fetchone()[0]
+                )
                 self.conn.execute(
                     """
                     DELETE FROM dbbardata
@@ -416,7 +416,7 @@ class DuckdbDatabase(BaseDatabase):
                     WHERE symbol = ? AND exchange = ?
                     """,
                     (symbol, exchange.value),
-                ).fetchone()[0]
+                )
                 self.conn.execute(
                     """
                     DELETE FROM dbtickdata
