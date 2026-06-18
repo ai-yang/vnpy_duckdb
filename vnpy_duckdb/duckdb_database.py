@@ -375,7 +375,7 @@ class DuckdbDatabase(BaseDatabase):
         with self.lock:
             self.conn.execute("BEGIN TRANSACTION")
             try:
-                count: int = self.conn.execute(
+                count: int = self._fetch_scalar_int(
                     """
                     SELECT count(*)
                     FROM dbbardata
@@ -409,7 +409,7 @@ class DuckdbDatabase(BaseDatabase):
         with self.lock:
             self.conn.execute("BEGIN TRANSACTION")
             try:
-                count: int = self.conn.execute(
+                count: int = self._fetch_scalar_int(
                     """
                     SELECT count(*)
                     FROM dbtickdata
@@ -441,8 +441,8 @@ class DuckdbDatabase(BaseDatabase):
     def get_bar_overview(self) -> list[BarOverview]:
         """Return bar data available in database."""
         with self.lock:
-            data_count: int = self.conn.execute("SELECT count(*) FROM dbbardata").fetchone()[0]
-            overview_count: int = self.conn.execute("SELECT count(*) FROM dbbaroverview").fetchone()[0]
+            data_count: int = self._fetch_scalar_int("SELECT count(*) FROM dbbardata")
+            overview_count: int = self._fetch_scalar_int("SELECT count(*) FROM dbbaroverview")
             if data_count and not overview_count:
                 self.init_bar_overview()
 
@@ -469,8 +469,8 @@ class DuckdbDatabase(BaseDatabase):
     def get_tick_overview(self) -> list[TickOverview]:
         """Return tick data available in database."""
         with self.lock:
-            data_count: int = self.conn.execute("SELECT count(*) FROM dbtickdata").fetchone()[0]
-            overview_count: int = self.conn.execute("SELECT count(*) FROM dbtickoverview").fetchone()[0]
+            data_count: int = self._fetch_scalar_int("SELECT count(*) FROM dbtickdata")
+            overview_count: int = self._fetch_scalar_int("SELECT count(*) FROM dbtickoverview")
             if data_count and not overview_count:
                 self.init_tick_overview()
 
@@ -686,6 +686,8 @@ class DuckdbDatabase(BaseDatabase):
             """,
             (symbol, exchange, interval),
         ).fetchone()
+        if row is None:
+            raise RuntimeError("Expected bar overview query to return one row.")
 
         count, start, end = row
         if count:
@@ -716,6 +718,8 @@ class DuckdbDatabase(BaseDatabase):
             """,
             (symbol, exchange),
         ).fetchone()
+        if row is None:
+            raise RuntimeError("Expected tick overview query to return one row.")
 
         count, start, end = row
         if count:
@@ -739,11 +743,15 @@ class DuckdbDatabase(BaseDatabase):
     @staticmethod
     def _bar_to_dict(bar: BarData) -> dict[str, Any]:
         """Convert BarData to a database row."""
+        interval: Interval | None = bar.interval
+        if interval is None:
+            raise ValueError("BarData interval is required.")
+
         return {
             "symbol": bar.symbol,
             "exchange": bar.exchange.value,
             "datetime": convert_tz(bar.datetime),
-            "interval": bar.interval.value,
+            "interval": interval.value,
             "volume": bar.volume,
             "turnover": bar.turnover,
             "open_interest": bar.open_interest,
@@ -808,6 +816,13 @@ class DuckdbDatabase(BaseDatabase):
         if dt and dt.tzinfo:
             return convert_tz(dt)
         return dt
+
+    def _fetch_scalar_int(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Fetch an integer scalar from a query that must return one row."""
+        row: tuple[Any, ...] | None = self.conn.execute(sql, params).fetchone()
+        if row is None:
+            raise RuntimeError("Expected scalar query to return one row.")
+        return int(row[0])
 
     @staticmethod
     def _restore_datetime(dt: datetime) -> datetime:
